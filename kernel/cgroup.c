@@ -1155,6 +1155,8 @@ static void cgroup_destroy_root(struct cgroup_root *root)
 	struct cgroup *cgrp = &root->cgrp;
 	struct cgrp_cset_link *link, *tmp_link;
 
+	trace_cgroup_destroy_root(root);
+
 	cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
 
 	BUG_ON(atomic_read(&root->nr_cgrps));
@@ -2028,6 +2030,8 @@ static int cgroup_setup_root(struct cgroup_root *root, u16 ss_mask)
 
 	ret = cgroup_bpf_inherit(root_cgrp);
 	WARN_ON_ONCE(ret);
+
+	trace_cgroup_setup_root(root);
 
 	/*
 	 * There must be no failure case after here, since rebinding takes
@@ -4420,6 +4424,8 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from)
 
 		if (task) {
 			ret = cgroup_migrate(task, false, to->root);
+			if (!ret)
+				trace_cgroup_transfer_tasks(to, task, false);
 			put_task_struct(task);
 		}
 	} while (task && !ret);
@@ -5375,6 +5381,8 @@ static int cgroup_mkdir(struct kernfs_node *parent_kn, const char *name,
 	ret = cgroup_apply_control_enable(cgrp);
 	if (ret)
 		goto out_destroy;
+
+	trace_cgroup_mkdir(cgrp);
 
 	/* let's create and online css's */
 	kernfs_activate(kn);
