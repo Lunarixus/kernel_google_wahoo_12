@@ -234,7 +234,6 @@ struct cgroup_namespace init_cgroup_ns = {
 static u16 have_canfork_callback __read_mostly;
 
 static struct file_system_type cgroup2_fs_type;
-
 static struct cftype cgroup_dfl_base_files[];
 static struct cftype cgroup_legacy_base_files[];
 
@@ -262,6 +261,9 @@ static int cgroup_addrm_files(struct cgroup_subsys_state *css,
  */
 static bool cgroup_ssid_enabled(int ssid)
 {
+	if (CGROUP_SUBSYS_COUNT == 0)
+		return false;
+
 	return static_key_enabled(cgroup_subsys_enabled_key[ssid]);
 }
 
@@ -752,10 +754,10 @@ static void css_set_move_task(struct task_struct *task,
 
 	if (to_cset) {
 		/*
-		 * We are synchronized through cgroup_threadgroup_rwsem
-		 * against PF_EXITING setting such that we can't race
-		 * against cgroup_exit() changing the css_set to
-		 * init_css_set and dropping the old one.
+		 * We are synchronized through css_set_lock against
+		 * PF_EXITING setting such that we can't race against
+		 * cgroup_exit() disassociating the task from the
+		 * css_set.
 		 */
 		WARN_ON_ONCE(task->flags & PF_EXITING);
 
@@ -1705,10 +1707,6 @@ static int parse_cgroupfs_options(char *data, struct cgroup_sb_opts *opts)
 			all_ss = true;
 			continue;
 		}
-		if (!strcmp(token, "__DEVEL__sane_behavior")) {
-			opts->flags |= CGRP_ROOT_SANE_BEHAVIOR;
-			continue;
-		}
 		if (!strcmp(token, "noprefix")) {
 			opts->flags |= CGRP_ROOT_NOPREFIX;
 			continue;
@@ -1775,15 +1773,6 @@ static int parse_cgroupfs_options(char *data, struct cgroup_sb_opts *opts)
 		}
 		if (i == CGROUP_SUBSYS_COUNT)
 			return -ENOENT;
-	}
-
-	if (opts->flags & CGRP_ROOT_SANE_BEHAVIOR) {
-		pr_warn("sane_behavior: this is still under development and its behaviors will change, proceed at your own risk\n");
-		if (nr_opts != 1) {
-			pr_err("sane_behavior: no other mount options allowed\n");
-			return -EINVAL;
-		}
-		return 0;
 	}
 
 	/*
@@ -2122,15 +2111,6 @@ static struct dentry *cgroup_mount(struct file_system_type *fs_type,
 	ret = parse_cgroupfs_options(data, &opts);
 	if (ret)
 		goto out_unlock;
-
-	/* look for a matching existing root */
-	if (opts.flags & CGRP_ROOT_SANE_BEHAVIOR) {
-		cgrp_dfl_visible = true;
-		root = &cgrp_dfl_root;
-		cgroup_get(&root->cgrp);
-		ret = 0;
-		goto out_unlock;
-	}
 
 	/*
 	 * Destruction of cgroup root is asynchronous, so subsystems may
@@ -3019,6 +2999,7 @@ int cgroup_attach_task_all(struct task_struct *from, struct task_struct *tsk)
 	int retval = 0;
 
 	mutex_lock(&cgroup_mutex);
+	percpu_down_write(&cgroup_threadgroup_rwsem);
 	for_each_root(root) {
 		struct cgroup *from_cgrp;
 
@@ -3033,6 +3014,7 @@ int cgroup_attach_task_all(struct task_struct *from, struct task_struct *tsk)
 		if (retval)
 			break;
 	}
+	percpu_up_write(&cgroup_threadgroup_rwsem);
 	mutex_unlock(&cgroup_mutex);
 
 	return retval;
@@ -4457,6 +4439,8 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from)
 
 	mutex_lock(&cgroup_mutex);
 
+	percpu_down_write(&cgroup_threadgroup_rwsem);
+
 	/* all tasks in @from are being moved, all csets are source */
 	spin_lock_irq(&css_set_lock);
 	list_for_each_entry(link, &from->cset_links, cset_link)
@@ -4474,6 +4458,10 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from)
 	do {
 		css_task_iter_start(&from->self, &it);
 
+		do {
+			task = css_task_iter_next(&it);
+		} while (task && (task->flags & PF_EXITING));
+
 		if (task)
 			get_task_struct(task);
 		css_task_iter_end(&it);
@@ -4487,6 +4475,7 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from)
 	} while (task && !ret);
 out_err:
 	cgroup_migrate_finish(&preloaded_csets);
+	percpu_up_write(&cgroup_threadgroup_rwsem);
 	mutex_unlock(&cgroup_mutex);
 	return ret;
 }
@@ -5815,6 +5804,7 @@ int __init cgroup_init(void)
 
 	WARN_ON(sysfs_create_mount_point(fs_kobj, "cgroup"));
 	WARN_ON(register_filesystem(&cgroup_fs_type));
+	WARN_ON(register_filesystem(&cgroup2_fs_type));
 	WARN_ON(!proc_create("cgroups", 0, NULL, &proc_cgroupstats_operations));
 
 	return 0;
@@ -6106,8 +6096,11 @@ void cgroup_exit(struct task_struct *tsk)
 	int i;
 
 	/*
-	 * Unlink from @tsk from its css_set.  As migration path can't race
-	 * with us, we can check css_set and cg_list without synchronization.
+	 * Avoid potential race with the migrate path.
+	 */
+	spin_lock_irq(&css_set_lock);
+	/*
+	 * Unlink from @tsk from its css_set.
 	 */
 	cset = task_css_set(tsk);
 
@@ -6116,6 +6109,8 @@ void cgroup_exit(struct task_struct *tsk)
 	} else {
 		get_css_set(cset);
 	}
+
+	spin_unlock_irq(&css_set_lock);
 
 	/* see cgroup_post_fork() for details */
 	do_each_subsys_mask(ss, i, have_exit_callback) {
