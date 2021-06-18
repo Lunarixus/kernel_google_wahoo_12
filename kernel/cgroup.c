@@ -233,6 +233,8 @@ struct cgroup_namespace init_cgroup_ns = {
 /* Ditto for the can_fork callback. */
 static u16 have_canfork_callback __read_mostly;
 
+static struct file_system_type cgroup2_fs_type;
+
 static struct cftype cgroup_dfl_base_files[];
 static struct cftype cgroup_legacy_base_files[];
 
@@ -2076,6 +2078,7 @@ static struct dentry *cgroup_mount(struct file_system_type *fs_type,
 			 int flags, const char *unused_dev_name,
 			 void *data)
 {
+	bool is_v2 = fs_type == &cgroup2_fs_type;
 	struct super_block *pinned_sb = NULL;
 	struct cgroup_namespace *ns = current->nsproxy->cgroup_ns;
 	struct cgroup_subsys *ss;
@@ -2122,7 +2125,7 @@ static struct dentry *cgroup_mount(struct file_system_type *fs_type,
 
 	/* look for a matching existing root */
 	if (opts.flags & CGRP_ROOT_SANE_BEHAVIOR) {
-		cgrp_dfl_root_visible = true;
+		cgrp_dfl_visible = true;
 		root = &cgrp_dfl_root;
 		cgroup_get(&root->cgrp);
 		ret = 0;
